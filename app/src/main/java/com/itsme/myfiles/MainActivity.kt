@@ -11,6 +11,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Environment
 import android.provider.Settings
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -19,6 +20,7 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -30,6 +32,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.Folder
+import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -38,13 +41,16 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.toArgb
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.itsme.myfiles.ui.theme.MyApplicationTheme
 import java.io.File
@@ -70,14 +76,21 @@ data class FileItem(
 class FileViewModel(application: Application) : AndroidViewModel(application) {
     private val prefs: SharedPreferences = application.getSharedPreferences("settings_prefs", Context.MODE_PRIVATE)
 
-    var currentPath: File by mutableStateOf(Environment.getExternalStorageDirectory())
-    var files by mutableStateOf<List<FileItem>>(emptyList())
+    class PaneState(initialPath: File) {
+        var currentPath by mutableStateOf(initialPath)
+        var files by mutableStateOf<List<FileItem>>(emptyList())
+        var selectedItem by mutableStateOf<FileItem?>(null)
+    }
+
+    var isSplitMode by mutableStateOf(false)
+    var splitRatio by mutableFloatStateOf(0.5f) // 0 to 1
+    val pane1 = PaneState(Environment.getExternalStorageDirectory())
+    val pane2 = PaneState(Environment.getExternalStorageDirectory())
+    var activePaneIndex by mutableIntStateOf(1)
+
     var showSettings by mutableStateOf(false)
     
-    // Store item counts in a separate map to avoid reloading the entire file list on every count update.
     val itemCounts = mutableStateMapOf<String, Int?>()
-
-    // Store scroll positions for each directory path: "path" -> (index, offset)
     val scrollPositions = mutableStateMapOf<String, Pair<Int, Int>>()
 
     // Persistent settings loaded from SharedPreferences
@@ -87,6 +100,7 @@ class FileViewModel(application: Application) : AndroidViewModel(application) {
     var themeMode by mutableStateOf(ThemeMode.valueOf(prefs.getString("themeMode", ThemeMode.SYSTEM.name) ?: ThemeMode.SYSTEM.name))
     var showDivider by mutableStateOf(prefs.getBoolean("showDivider", true))
     var itemSpacing by mutableFloatStateOf(prefs.getFloat("itemSpacing", 4f))
+    var showItemCount by mutableStateOf(prefs.getBoolean("showItemCount", false))
 
     fun updateSetting(action: SharedPreferences.Editor.() -> Unit) {
         prefs.edit().apply {
@@ -95,11 +109,12 @@ class FileViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun loadFiles(path: File, saveScrollIndex: Int? = null, saveScrollOffset: Int? = null) {
+    fun loadFiles(path: File, pane: PaneState, saveScrollIndex: Int? = null, saveScrollOffset: Int? = null) {
         if (saveScrollIndex != null && saveScrollOffset != null) {
-            scrollPositions[currentPath.absolutePath] = saveScrollIndex to saveScrollOffset
+            scrollPositions[pane.currentPath.absolutePath] = saveScrollIndex to saveScrollOffset
         }
-        currentPath = path
+        pane.currentPath = path
+        pane.selectedItem = null
         val list = path.listFiles()?.map {
             FileItem(
                 it,
@@ -109,7 +124,29 @@ class FileViewModel(application: Application) : AndroidViewModel(application) {
                 formatDate(it.lastModified())
             )
         }?.sortedWith(compareBy({ !it.isDirectory }, { it.name.lowercase() })) ?: emptyList()
-        files = list
+        pane.files = list
+    }
+
+    fun copyFile(source: File, targetDir: File, onComplete: (Boolean) -> Unit) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val success = try {
+                val dest = File(targetDir, source.name)
+                if (source.isDirectory) {
+                    source.copyRecursively(dest, overwrite = true)
+                } else {
+                    source.copyTo(dest, overwrite = true)
+                }
+                true
+            } catch (e: Exception) {
+                false
+            }
+            withContext(Dispatchers.Main) {
+                onComplete(success)
+                // Refresh both panes just in case
+                loadFiles(pane1.currentPath, pane1)
+                loadFiles(pane2.currentPath, pane2)
+            }
+        }
     }
 
     private fun formatSize(bytes: Long): String {
@@ -124,18 +161,18 @@ class FileViewModel(application: Application) : AndroidViewModel(application) {
         return sdf.format(Date(timestamp))
     }
 
-    fun canNavigateBack(): Boolean {
+    fun canNavigateBack(pane: PaneState): Boolean {
         val root = Environment.getExternalStorageDirectory().absolutePath
-        return currentPath.absolutePath != root && currentPath.absolutePath != "/"
+        return pane.currentPath.absolutePath != root && pane.currentPath.absolutePath != "/"
     }
 
-    fun navigateBack(saveScrollIndex: Int? = null, saveScrollOffset: Int? = null) {
+    fun navigateBack(pane: PaneState, saveScrollIndex: Int? = null, saveScrollOffset: Int? = null) {
         if (saveScrollIndex != null && saveScrollOffset != null) {
-            scrollPositions[currentPath.absolutePath] = saveScrollIndex to saveScrollOffset
+            scrollPositions[pane.currentPath.absolutePath] = saveScrollIndex to saveScrollOffset
         }
-        val parent = currentPath.parentFile
-        if (parent != null && canNavigateBack()) {
-            loadFiles(parent)
+        val parent = pane.currentPath.parentFile
+        if (parent != null && canNavigateBack(pane)) {
+            loadFiles(parent, pane)
         }
     }
 }
@@ -174,7 +211,10 @@ fun FileExplorerApp(viewModel: FileViewModel) {
 
     LaunchedEffect(hasPermission) {
         if (hasPermission) {
-            viewModel.loadFiles(viewModel.currentPath)
+            viewModel.loadFiles(viewModel.pane1.currentPath, viewModel.pane1)
+            if (viewModel.isSplitMode) {
+                viewModel.loadFiles(viewModel.pane2.currentPath, viewModel.pane2)
+            }
         }
     }
 
@@ -209,7 +249,37 @@ fun FileExplorerApp(viewModel: FileViewModel) {
             SettingsScreen(viewModel)
         } else {
             FileScanner(viewModel)
-            FileBrowser(viewModel)
+            BoxWithConstraints(modifier = Modifier.fillMaxSize().statusBarsPadding()) {
+                val maxHeight = constraints.maxHeight.toFloat()
+                Column(modifier = Modifier.fillMaxSize()) {
+                    val p1Weight = if (viewModel.isSplitMode) viewModel.splitRatio else 1f
+                    
+                    Box(modifier = Modifier.weight(p1Weight)) {
+                        FileBrowser(viewModel, viewModel.pane1, isPrimary = true)
+                    }
+                    
+                    if (viewModel.isSplitMode) {
+                        // Draggable Divider
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(8.dp)
+                                .background(MaterialTheme.colorScheme.outlineVariant)
+                                .pointerInput(Unit) {
+                                    detectDragGestures { change, dragAmount ->
+                                        change.consume()
+                                        val delta = dragAmount.y / maxHeight
+                                        viewModel.splitRatio = (viewModel.splitRatio + delta).coerceIn(0.1f, 0.9f)
+                                    }
+                                }
+                        )
+                        
+                        Box(modifier = Modifier.weight(1f - viewModel.splitRatio)) {
+                            FileBrowser(viewModel, viewModel.pane2, isPrimary = false)
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -230,7 +300,7 @@ fun PermissionRequestScreen(onRequest: () -> Unit) {
     Box(modifier = Modifier.fillMaxSize().padding(32.dp), contentAlignment = Alignment.Center) {
         Column(horizontalAlignment = Alignment.CenterHorizontally) {
             Text("Storage access is required to show your files.", style = MaterialTheme.typography.bodyLarge)
-                        Spacer(modifier = Modifier.height(24.dp))
+            Spacer(modifier = Modifier.height(24.dp))
             Button(onClick = onRequest) {
                 Text("Grant Permission")
             }
@@ -240,8 +310,15 @@ fun PermissionRequestScreen(onRequest: () -> Unit) {
 
 @Composable
 fun FileScanner(viewModel: FileViewModel) {
-    LaunchedEffect(viewModel.files) {
-        viewModel.files.forEach { item ->
+    LaunchedEffect(viewModel.pane1.files, viewModel.pane2.files, viewModel.isSplitMode, viewModel.showItemCount) {
+        if (!viewModel.showItemCount) return@LaunchedEffect
+        
+        val allFiles = mutableListOf<FileItem>()
+        allFiles.addAll(viewModel.pane1.files)
+        if (viewModel.isSplitMode) {
+            allFiles.addAll(viewModel.pane2.files)
+        }
+        allFiles.forEach { item ->
             if (item.isDirectory && !viewModel.itemCounts.containsKey(item.file.absolutePath)) {
                 launch(Dispatchers.IO) {
                     val count = try {
@@ -259,43 +336,104 @@ fun FileScanner(viewModel: FileViewModel) {
 }
 
 @Composable
-fun FileBrowser(viewModel: FileViewModel) {
-    val listState = remember(viewModel.currentPath.absolutePath) {
-        val savedPos = viewModel.scrollPositions[viewModel.currentPath.absolutePath]
+fun FileBrowser(
+    viewModel: FileViewModel,
+    pane: FileViewModel.PaneState,
+    isPrimary: Boolean,
+    modifier: Modifier = Modifier
+) {
+    val context = LocalContext.current
+    val listState = remember(pane.currentPath.absolutePath) {
+        val savedPos = viewModel.scrollPositions[pane.currentPath.absolutePath]
         LazyListState(
             firstVisibleItemIndex = savedPos?.first ?: 0,
             firstVisibleItemScrollOffset = savedPos?.second ?: 0
         )
     }
 
-    BackHandler(enabled = viewModel.canNavigateBack()) {
-        viewModel.navigateBack(listState.firstVisibleItemIndex, listState.firstVisibleItemScrollOffset)
+    val isActive = if (viewModel.isSplitMode) {
+        (isPrimary && viewModel.activePaneIndex == 1) || (!isPrimary && viewModel.activePaneIndex == 2)
+    } else {
+        isPrimary
     }
 
-    Column(modifier = Modifier.fillMaxSize().statusBarsPadding()) {
+    BackHandler(enabled = isActive && viewModel.canNavigateBack(pane)) {
+        viewModel.navigateBack(pane, listState.firstVisibleItemIndex, listState.firstVisibleItemScrollOffset)
+    }
+
+    Column(modifier = modifier.fillMaxSize()) {
         Row(
             modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 2.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
             Text(
-                text = viewModel.currentPath.path,
+                text = pane.currentPath.path,
                 fontSize = 10.sp,
-                color = Color.Gray,
+                color = if (isActive) MaterialTheme.colorScheme.primary else Color.Gray,
                 modifier = Modifier.weight(1f).padding(start = 4.dp),
                 maxLines = 1
             )
-            IconButton(onClick = { viewModel.showSettings = true }, modifier = Modifier.size(24.dp)) {
-                Icon(
-                    Icons.Default.Settings,
-                    contentDescription = "Settings",
-                    modifier = Modifier.size(16.dp),
-                    tint = Color.Gray.copy(alpha = 0.6f)
-                )
+            
+            var showMenu by remember { mutableStateOf(false) }
+            Box {
+                IconButton(onClick = { showMenu = true }, modifier = Modifier.size(24.dp)) {
+                    Icon(
+                        Icons.Default.MoreVert,
+                        contentDescription = "Menu",
+                        modifier = Modifier.size(16.dp),
+                        tint = Color.Gray.copy(alpha = 0.6f)
+                    )
+                }
+                DropdownMenu(
+                    expanded = showMenu,
+                    onDismissRequest = { showMenu = false }
+                ) {
+                    DropdownMenuItem(
+                        text = { Text("Settings") },
+                        onClick = {
+                            showMenu = false
+                            viewModel.showSettings = true
+                        }
+                    )
+                    
+                    if (isPrimary) {
+                        DropdownMenuItem(
+                            text = {
+                                Text(if (viewModel.isSplitMode) "Close Split View" else "Split Window")
+                            },
+                            onClick = {
+                                showMenu = false
+                                if (viewModel.isSplitMode) {
+                                    viewModel.isSplitMode = false
+                                } else {
+                                    viewModel.isSplitMode = true
+                                    viewModel.loadFiles(viewModel.pane2.currentPath, viewModel.pane2)
+                                }
+                            }
+                        )
+                    }
+
+                    if (viewModel.isSplitMode && pane.selectedItem != null) {
+                        val otherPane = if (isPrimary) viewModel.pane2 else viewModel.pane1
+                        val actionText = if (isPrimary) "Copy to Lower View" else "Copy to Upper View"
+                        DropdownMenuItem(
+                            text = { Text(actionText) },
+                            onClick = {
+                                showMenu = false
+                                viewModel.copyFile(pane.selectedItem!!.file, otherPane.currentPath) { success ->
+                                    Toast.makeText(context, if (success) "Copied successfully" else "Copy failed", Toast.LENGTH_SHORT).show()
+                                }
+                            }
+                        )
+                    }
+                }
             }
         }
 
-        if (viewModel.files.isEmpty()) {
-            Box(modifier = Modifier.fillMaxSize().weight(1f), contentAlignment = Alignment.Center) {
+        if (pane.files.isEmpty()) {
+            Box(modifier = Modifier.fillMaxSize().weight(1f).clickable { 
+                if (isPrimary) viewModel.activePaneIndex = 1 else viewModel.activePaneIndex = 2
+            }, contentAlignment = Alignment.Center) {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
                     Icon(
                         Icons.Default.Folder,
@@ -312,20 +450,28 @@ fun FileBrowser(viewModel: FileViewModel) {
                 modifier = Modifier.fillMaxSize().weight(1f),
                 contentPadding = PaddingValues(bottom = 16.dp)
             ) {
-                items(viewModel.files, key = { it.file.absolutePath }) { item ->
+                items(pane.files, key = { it.file.absolutePath }) { item ->
                     FileRow(
                         item = item,
+                        isSelected = pane.selectedItem == item,
                         nameFontSize = viewModel.nameFontSize,
                         infoFontSize = viewModel.infoFontSize,
                         folderColor = viewModel.folderColor,
                         itemSpacing = viewModel.itemSpacing,
                         itemCount = viewModel.itemCounts[item.file.absolutePath],
+                        showItemCount = viewModel.showItemCount,
                         onFolderClick = {
+                            if (isPrimary) viewModel.activePaneIndex = 1 else viewModel.activePaneIndex = 2
                             viewModel.loadFiles(
                                 item.file,
+                                pane,
                                 listState.firstVisibleItemIndex,
                                 listState.firstVisibleItemScrollOffset
                             )
+                        },
+                        onClick = {
+                            if (isPrimary) viewModel.activePaneIndex = 1 else viewModel.activePaneIndex = 2
+                            pane.selectedItem = if (pane.selectedItem == item) null else item
                         }
                     )
                     if (viewModel.showDivider) {
@@ -344,21 +490,29 @@ fun FileBrowser(viewModel: FileViewModel) {
 @Composable
 fun FileRow(
     item: FileItem,
+    isSelected: Boolean,
     nameFontSize: Float,
     infoFontSize: Float,
     folderColor: Color,
     itemSpacing: Float,
     itemCount: Int?,
-    onFolderClick: () -> Unit
+    showItemCount: Boolean,
+    onFolderClick: () -> Unit,
+    onClick: () -> Unit = {}
 ) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
+            .background(if (isSelected) MaterialTheme.colorScheme.primaryContainer else Color.Transparent)
             .clickable {
-                if (item.isDirectory) {
+                onClick()
+                // If it's a folder, we might want to navigate on double click or just selection?
+                // The prompt says "once any item is selected". 
+                // Let's keep clicking for selection, and navigate on double click or just add a 'Open' button?
+                // Actually, the previous version navigated on click. 
+                // To support selection, I'll make the first click select, and if it's already selected and is a folder, navigate.
+                if (isSelected && item.isDirectory) {
                     onFolderClick()
-                } else {
-                    // Open file logic could be added here
                 }
             }
             .padding(horizontal = 16.dp, vertical = itemSpacing.dp),
@@ -388,8 +542,16 @@ fun FileRow(
             
             Column(horizontalAlignment = Alignment.End) {
                 if (item.isDirectory) {
+                    if (showItemCount) {
+                        Text(
+                            text = if (itemCount != null) "$itemCount items" else "counting...",
+                            fontSize = infoFontSize.sp,
+                            color = Color.Gray,
+                            textAlign = TextAlign.End
+                        )
+                    }
                     Text(
-                        text = if (itemCount != null) "$itemCount items" else "counting...",
+                        text = item.lastModified,
                         fontSize = infoFontSize.sp,
                         color = Color.Gray,
                         textAlign = TextAlign.End
@@ -522,6 +684,18 @@ fun SettingsScreen(viewModel: FileViewModel) {
                 onCheckedChange = { 
                     viewModel.showDivider = it
                     viewModel.updateSetting { putBoolean("showDivider", it) }
+                }
+            )
+        }
+
+        // Show Item Count
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text("Show Folder Item Count", modifier = Modifier.weight(1f))
+            Switch(
+                checked = viewModel.showItemCount,
+                onCheckedChange = { 
+                    viewModel.showItemCount = it
+                    viewModel.updateSetting { putBoolean("showItemCount", it) }
                 }
             )
         }
